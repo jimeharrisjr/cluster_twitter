@@ -1,0 +1,111 @@
+---
+title: "Clustering Twitter Users"
+output:
+  html_document:
+    df_print: paged
+---
+
+A quick and dirty look at trying to find inauthentic (bot) behavior in Twitter using graph clustering.
+
+```{r, message=FALSE}
+# load libraries to make this easier
+library(stringdist)
+library(visNetwork)
+library(dplyr)
+library(igraph)
+library(data.table)
+library(rtweet)
+library(lubridate)
+```
+
+Look at tweets around "dictatorBiden" - Note: assumes you've already set up rtweet according to the instructions [here](https://cran.r-project.org/web/packages/rtweet/vignettes/auth.html)
+
+```{r, eval=FALSE}
+q<-'dictatorbiden'
+rt<-search_tweets(q,n=10000)
+setDT(rt) # make this into a data.table for easy handling (could do all of this in tidyverse, as well)
+```
+
+```{r, echo=FALSE}
+# load the dataset collected previously on 9/11/21
+rt<-fread('dictatorbiden_tweets.gz')
+```
+
+Now with a data table of tweets, subset it to get a unique frame of IDs spreading these tweets. Keep the created date so we can see another element of potential inauthentic behavior - coincident acount creations beyond what would be expected in the "birthday paradox"
+
+```{r}
+# get just the date
+rt[,acct_date:=date(account_created_at)]
+# create a subset a where we count the unique number
+a<-unique(rt[,.(screen_name,acct_date)])
+a[,N:=.N, by=acct_date]
+a[order(-N)]
+```
+
+There seem to be a lot of accounts created yesterday suddenly tweeting this (a clue!). How many were made in the last month?
+```{r}
+a[acct_date>=ymd('2021-08-11')]
+
+```
+
+What's the spread on repeated creation dates?
+```{r}
+quantile(a$N, probs = seq(0,1,by=.1))
+```
+80% of our subjects have creation dates that coincide with 3 or more others.
+
+Let's look at that (zoom in and out, select a node to highlight nearest neighbors):
+
+```{r}
+b<-a[N>4]
+edges<-b[,.(from=screen_name, to=as.character(acct_date))]
+nodes<-data.table(id=unique(c(b$screen_name,as.character(b$acct_date))))
+edges[,length:=.N, by=from]
+nodes[id %in% edges$to, shape:='ellipse']
+nodes[id %in% edges$to, color:='red']
+nodes[,label:=id]
+visNetwork(nodes=nodes, edges=edges) %>% visIgraphLayout(layout = 'layout_with_fr') %>% visOptions(highlightNearest = TRUE)
+
+```
+
+
+
+```{r}
+snames<-b$screen_name
+m<-stringdistmatrix(snames, method = 'lv')
+mdt<-as.data.table(as.matrix(m))
+colnames(mdt)<-snames
+
+sndt<-data.table(name=snames)
+mdt<-cbind(sndt,mdt)
+mmdt<-melt(mdt,id.vars = 'name')
+mmdt<-mmdt[value>0]
+dt<-data.table()
+for (n in snames){d<-rbind(mmdt[name==n][value==min(value)],mmdt[variable==n][value==min(value)]); dt<-rbind(dt,d)}
+nedges<-dt[,.(from=name, to=variable, length=value)]
+nedges[,to:=as.character(to)]
+nnodes<-data.table(id=unique(c(nedges$to,nedges$from)))
+net<-graph_from_data_frame(nedges)
+cfg<-cluster_fast_greedy(as.undirected(net))
+groupnodes<-data.table(id=cfg$names, group=cfg$membership)
+nnodes<-merge(nnodes,groupnodes)
+visNetwork(nodes=nnodes, edges=nedges, w=1280, h=1024) %>% visIgraphLayout(layout = 'layout_with_fr') %>% visOptions(highlightNearest = TRUE)
+
+```
+
+Put the two graphs together, but limit it to accounts created in the last month:
+```{r}
+d<-a[acct_date>=ymd('2021-08-10')]
+dnodes<-c(d$screen_name,as.character(d$acct_date))
+alledges<-rbind(edges,nedges)
+alledges<-alledges[from %in% dnodes & to %in% dnodes]
+allnodes<-data.table(id=unique(c(alledges$from,alledges$to)))
+
+allnet<-graph_from_data_frame(alledges)
+ceb<-cluster_edge_betweenness(as.undirected(allnet))
+cebdf<-data.table(id=ceb$names, group=ceb$membership)
+allnodes<-merge(allnodes,cebdf)
+allnodes[id %in% as.character(a$acct_date), shape:='square']
+visNetwork(nodes=allnodes, edges=alledges, w=1280, h=1024) %>% visIgraphLayout(layout = 'layout_with_fr') %>% visOptions(highlightNearest = TRUE)
+```
+
